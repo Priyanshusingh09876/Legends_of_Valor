@@ -1,446 +1,617 @@
-package mh.game;
+/**
+ * Role: Runs the Legends of Valor game mode, wiring world state, combat, menus, and turn handling.
+ * Pattern(s): Template Method ;
+ * Notes: Game controller
+ */
+package final_project.game.valor;
 
 import java.io.IOException;
 import java.nio.file.Paths;
-import java.util.*;
-import mh.data.DataLoader;
-import mh.data.GameData;
-import mh.model.Hero;
-import mh.model.Monster;
-import mh.world.Position;
-import mh.world.ValorWorld;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.Scanner;
 
+import final_project.game.CombatResolver;
+import final_project.shared.data.DataLoader;
+import final_project.shared.data.GameData;
+import final_project.game.RPGGame;
+import final_project.shared.command.CommandRegistry;
+import final_project.items.Item;
+import final_project.items.Potion;
+import final_project.items.Spell;
+import final_project.shared.info.InfoMenu;
+import final_project.shared.info.InfoProvider;
+import final_project.shared.market.MarketMenu;
+import final_project.shared.market.MarketCallbacks;
+import final_project.shared.market.MarketAccessPolicy;
+import final_project.shared.market.Market;
+import final_project.shared.Move.MoveHandler;
+import final_project.shared.Move.MoveAdapter;
+import final_project.shared.Equip.EquipMenu;
+import final_project.game.ActionResult;
+import final_project.model.Hero;
+import final_project.model.Monster;
+import final_project.shared.UI.ColorUtil;
+import final_project.shared.util.InputUtil;
+import final_project.world.Position;
+import final_project.world.ValorWorld;
 public class LegendsOfValorGame extends RPGGame {
-    private final Scanner scanner;
+    private static final int LANE_COUNT = 3;
     private final Random random;
+
     private ValorWorld world;
-    private List<Hero> heroes;
-    private List<Monster> monsters;
+    private ValorBoard board;
+    private CombatResolver combatResolver;
+    private MonsterController monsterController;
+    private SpawnManager spawnManager;
+    private Market market;
+    private MarketMenu marketMenu;
+    private InfoMenu infoMenu;
+    private EquipMenu equipMenu;
+    private CommandRegistry<Hero> heroCommands;
+    private BattleUI battleUI;
+
+    private final List<Hero> heroes = new ArrayList<>();
+    private final List<Monster> monsters = new ArrayList<>();
     private GameData gameData;
     private int roundNumber;
-    private int difficulty;
+    private int spawnInterval;
+    private boolean needsRender;
+    private boolean roundHeaderPending;
+    private int currentHeroIndex;
+    private boolean turnConsumed;
+    private GameEndReason endReason;
 
     public LegendsOfValorGame() {
         this(new Scanner(System.in), new Random());
     }
 
     public LegendsOfValorGame(Scanner scanner, Random random) {
-        this.scanner = scanner;
+        super(scanner);
         this.random = random;
-        this.heroes = new ArrayList<>();
-        this.monsters = new ArrayList<>();
-        this.roundNumber = 0;
+    }
+
+    public void start() {
+        play();
     }
 
     @Override
     protected void initGame() {
+        gameOver = false;
+        roundNumber = 0;
+        needsRender = true;
+        roundHeaderPending = true;
+        currentHeroIndex = 0;
         System.out.println("=== Legends of Valor ===");
-
-        // Load game data
         try {
             gameData = new DataLoader(Paths.get(".")).load();
         } catch (IOException e) {
             System.out.println("Failed to load data: " + e.getMessage());
-            stopGame();
+            gameOver = true;
             return;
         }
 
-        // Select difficulty
-        difficulty = selectDifficulty();
+        spawnInterval = selectDifficulty();
+        world = new ValorWorld(random);
+        board = new ValorBoard(world);
+        combatResolver = new CombatResolver(board, random);
+        monsterController = new MonsterController(board, combatResolver);
+        spawnManager = new SpawnManager(board, gameData, random);
+        market = new Market(gameData.getWeapons(), gameData.getArmors(), gameData.getPotions(), gameData.getSpells());
+        marketMenu = new MarketMenu(market, in, createValorMarketPolicy(), createValorMarketCallbacks());
+        setupHeroCommands();
+        battleUI = new BattleUI();
+        infoMenu = new InfoMenu(in, createInfoProvider(), hero -> {});
+        equipMenu = new EquipMenu(in);
 
-        // Create world
-        world = new ValorWorld();
-
-        // Select 3 heroes
         selectHeroes();
-
-        // Place heroes in their lanes
         placeHeroesInLanes();
+        monsters.addAll(spawnManager.spawnWave(heroes));
+        startNewRound();
 
-        // Spawn initial monsters
-        spawnMonsters();
+        System.out.println("Reach the monster Nexus (top row) to win. Defend your Nexus (bottom row) to survive.");
+    }
 
-        System.out.println("\nGame started! Reach the monsters' Nexus (row 0) to win!");
-        System.out.println("Prevent monsters from reaching your Nexus (row 7)!\n");
+    private void startNewRound() {
+        roundNumber++;
+        reviveFaintedHeroes();
+        roundHeaderPending = true;
+        currentHeroIndex = indexOfFirstAliveHero();
+        if (currentHeroIndex < 0) {
+            endGame(GameEndReason.MONSTER_WIN_NEXUS);
+            return;
+        }
+        needsRender = true;
     }
 
     @Override
-    protected void runTurn() {
-        roundNumber++;
-        System.out.println("\n" + "=".repeat(50));
-        System.out.println("ROUND " + roundNumber);
-        System.out.println("=".repeat(50));
+    protected void render() {
+        Hero current = currentHero();
+        renderGameView(roundHeaderPending, current);
+        roundHeaderPending = false;
+        needsRender = false;
+    }
 
-        // Display map
-        world.printMap();
+    @Override
+    protected String prompt() {
+        Hero current = currentHero();
+        if (current == null) {
+            return "";
+        }
+        return "Actions: " + heroCommands.describeActions() + "\n" + current.getName() + " - choose action: ";
+    }
 
-        // Heroes' turn (YOUR IMPLEMENTATION HERE)
-        heroesTurn();
+    @Override
+    protected ActionResult handleInput(String input) {
+        turnConsumed = false;
+        if (gameOver) {
+            return ActionResult.failure(null);
+        }
+        Hero hero = currentHero();
+        if (hero == null) {
+            endGame(GameEndReason.MONSTER_WIN_NEXUS);
+            return ActionResult.failure(null);
+        }
+        if (input == null) {
+            quitGame();
+            return ActionResult.failure("Input closed. Exiting game.");
+        }
+        String trimmed = input.trim().toUpperCase();
+        if (trimmed.isEmpty()) {
+            return ActionResult.failure("Please enter a command.");
+        }
+        if (!heroCommands.hasCommand(trimmed)) {
+            return ActionResult.failure("Invalid action. Try again.");
+        }
+        boolean turnEnded = heroCommands.dispatch(trimmed, hero);
+        turnConsumed = turnEnded;
+        if (gameOver) {
+            return ActionResult.failure(null);
+        }
+        return ActionResult.success(null);
+    }
 
-        // Check win condition
-        if (checkHeroesWin()) {
-            System.out.println("\n🎉 VICTORY! A hero reached the monsters' Nexus!");
-            stopGame();
+    @Override
+    protected void afterInput(ActionResult r) {
+        if (gameOver) {
             return;
         }
+        if (turnConsumed) {
+            monsters.removeIf(Monster::isFainted);
+            advanceAfterHeroTurn();
+        }
+    }
 
-        // Monsters' turn (teammate will implement)
+    @Override
+    protected boolean shouldRender() {
+        boolean render = needsRender;
+        needsRender = false;
+        return render;
+    }
+
+    @Override
+    protected boolean isGameOver() {
+        return gameOver;
+    }
+
+    @Override
+    protected void renderGameOverSummary() {
+        printGameOverSummary();
+    }
+
+    private void advanceAfterHeroTurn() {
+        Hero next = nextAliveHero(currentHeroIndex + 1);
+        if (next != null) {
+            currentHeroIndex = heroes.indexOf(next);
+            needsRender = true;
+            return;
+        }
         monstersTurn();
-
-        // Check lose condition
-        if (checkMonstersWin()) {
-            System.out.println("\n💀 DEFEAT! A monster reached your Nexus!");
-            stopGame();
+        if (gameOver) {
             return;
         }
-
-        // Spawn new monsters if needed
-        if (roundNumber % difficulty == 0) {
-            System.out.println("\n⚠️  New monsters spawning!");
-            spawnMonsters();
-        }
-
-        // End of round regeneration
-        endOfRoundRegeneration();
+        spawnIfNeeded();
+        regenerateHeroes();
+        startNewRound();
     }
 
-    // ========================================================================
-    // YOUR MOVEMENT IMPLEMENTATION
-    // ========================================================================
+    private Hero currentHero() {
+        if (currentHeroIndex < 0 || currentHeroIndex >= heroes.size()) {
+            return null;
+        }
+        Hero hero = heroes.get(currentHeroIndex);
+        if (hero != null && hero.isFainted()) {
+            Hero next = nextAliveHero(currentHeroIndex + 1);
+            if (next != null) {
+                currentHeroIndex = heroes.indexOf(next);
+                return next;
+            }
+            return null;
+        }
+        return hero;
+    }
 
-    private void heroesTurn() {
+    private int indexOfFirstAliveHero() {
         for (int i = 0; i < heroes.size(); i++) {
-            Hero hero = heroes.get(i);
-
-            if (hero.isFainted()) {
-                System.out.println(hero.getName() + " is fainted, skipping turn.");
-                continue;
-            }
-
-            boolean actionTaken = false;
-            while (!actionTaken) {
-                System.out.println("\n" + "-".repeat(50));
-                displayHeroStatus(hero);
-                displayActions();
-
-                String input = scanner.nextLine().trim().toUpperCase();
-
-                switch (input) {
-                    case "W": case "A": case "S": case "D":
-                        actionTaken = handleMove(hero, input.charAt(0));
-                        break;
-                    case "T":
-                        actionTaken = handleTeleport(hero);
-                        break;
-                    case "R":
-                        actionTaken = handleRecall(hero);
-                        break;
-                    case "Q":
-                        // Teammate will implement attack
-                        System.out.println("Attack not yet implemented.");
-                        break;
-                    case "E":
-                        // Teammate will implement spell
-                        System.out.println("Spell not yet implemented.");
-                        break;
-                    case "P":
-                        // Teammate will implement potion
-                        System.out.println("Potion not yet implemented.");
-                        break;
-                    case "I":
-                        showInfo();
-                        break;
-                    case "M":
-                        // Teammate will implement market
-                        System.out.println("Market not yet implemented.");
-                        break;
-                    default:
-                        System.out.println("Invalid action. Try again.");
-                }
-            }
-
-            // Show updated map after each hero acts
-            world.printMap();
-        }
-    }
-
-    private void displayActions() {
-        System.out.println("\n📋 Actions:");
-        System.out.println("  W/A/S/D - Move (North/West/South/East)");
-        System.out.println("  T - Teleport to another lane");
-        System.out.println("  R - Recall to your Nexus");
-        System.out.println("  Q - Attack");
-        System.out.println("  E - Cast Spell");
-        System.out.println("  P - Use Potion");
-        System.out.println("  M - Market (at Nexus)");
-        System.out.println("  I - Show Info");
-        System.out.print("\nChoose action: ");
-    }
-
-    private void displayHeroStatus(Hero hero) {
-        Position pos = world.getPosition(hero);
-        System.out.println("\n🦸 " + hero.getName() + "'s Turn");
-        System.out.println("   Position: (" + pos.getRow() + ", " + pos.getCol() + ")");
-        System.out.println("   HP: " + (int)hero.getHp() + "/" + (int)hero.getMaxHp());
-        System.out.println("   MP: " + (int)hero.getMana() + "/" + (int)hero.getMaxMana());
-    }
-
-    // ========================================================================
-    // MOVEMENT HANDLER (YOUR PRIMARY IMPLEMENTATION)
-    // ========================================================================
-
-    private boolean handleMove(Hero hero, char direction) {
-        Position current = world.getPosition(hero);
-        Position target = getTargetPosition(current, direction);
-
-        if (target == null) {
-            System.out.println("❌ Cannot move there (out of bounds).");
-            return false;
-        }
-
-        if (!world.canMove(hero, current, target)) {
-            System.out.println("❌ Cannot move there (blocked/invalid).");
-            return false;
-        }
-
-        if (world.move(hero, target)) {
-            System.out.println("✅ " + hero.getName() + " moved " + directionName(direction) + ".");
-            return true;
-        }
-
-        return false;
-    }
-
-    private Position getTargetPosition(Position current, char direction) {
-        int row = current.getRow();
-        int col = current.getCol();
-
-        switch (direction) {
-            case 'W': row--; break; // North
-            case 'S': row++; break; // South
-            case 'A': col--; break; // West
-            case 'D': col++; break; // East
-            default: return null;
-        }
-
-        try {
-            return new Position(row, col);
-        } catch (IllegalArgumentException e) {
-            return null; // Out of bounds
-        }
-    }
-
-    private String directionName(char dir) {
-        switch (dir) {
-            case 'W': return "North";
-            case 'S': return "South";
-            case 'A': return "West";
-            case 'D': return "East";
-            default: return "Unknown";
-        }
-    }
-
-    // ========================================================================
-    // TELEPORT HANDLER (YOUR PRIMARY IMPLEMENTATION)
-    // ========================================================================
-
-    private boolean handleTeleport(Hero hero) {
-        // Step 1: Find heroes in other lanes
-        List<Hero> otherLaneHeroes = getHeroesInOtherLanes(hero);
-
-        if (otherLaneHeroes.isEmpty()) {
-            System.out.println("❌ No heroes in other lanes to teleport to.");
-            return false;
-        }
-
-        // Step 2: Let player choose target hero
-        System.out.println("\n📍 Select hero to teleport near:");
-        for (int i = 0; i < otherLaneHeroes.size(); i++) {
-            Hero target = otherLaneHeroes.get(i);
-            Position pos = world.getPosition(target);
-            System.out.printf("  %d) %s at (%d, %d) - Lane %d\n",
-                    i + 1, target.getName(), pos.getRow(), pos.getCol(), getLane(pos.getCol()) + 1);
-        }
-        System.out.println("  0) Cancel");
-
-        int choice = promptInt("Choose hero: ", 0, otherLaneHeroes.size());
-        if (choice == 0) {
-            System.out.println("Teleport cancelled.");
-            return false;
-        }
-
-        Hero targetHero = otherLaneHeroes.get(choice - 1);
-        Position targetPos = world.getPosition(targetHero);
-
-        // Step 3: Get valid destinations
-        List<Position> validDests = getValidTeleportDestinations(hero, targetHero, targetPos);
-
-        if (validDests.isEmpty()) {
-            System.out.println("❌ No valid teleport destinations near " + targetHero.getName() + ".");
-            return false;
-        }
-
-        // Step 4: Let player choose destination
-        System.out.println("\n📍 Select destination:");
-        for (int i = 0; i < validDests.size(); i++) {
-            Position dest = validDests.get(i);
-            System.out.printf("  %d) (%d, %d) - %s of %s\n",
-                    i + 1, dest.getRow(), dest.getCol(),
-                    getDirection(targetPos, dest), targetHero.getName());
-        }
-
-        choice = promptInt("Choose destination: ", 1, validDests.size());
-        Position dest = validDests.get(choice - 1);
-
-        // Step 5: Execute teleport
-        if (world.relocateHero(hero, dest)) {
-            System.out.println("✅ " + hero.getName() + " teleported to (" +
-                    dest.getRow() + ", " + dest.getCol() + ")!");
-            return true;
-        } else {
-            System.out.println("❌ Teleport failed.");
-            return false;
-        }
-    }
-
-    private List<Hero> getHeroesInOtherLanes(Hero hero) {
-        Position heroPos = world.getPosition(hero);
-        int heroLane = getLane(heroPos.getCol());
-
-        List<Hero> result = new ArrayList<>();
-        for (Hero h : heroes) {
-            if (h == hero || h.isFainted()) continue;
-
-            Position hPos = world.getPosition(h);
-            int hLane = getLane(hPos.getCol());
-
-            if (hLane != heroLane && hLane != -1) {
-                result.add(h);
+            if (!heroes.get(i).isFainted()) {
+                return i;
             }
         }
-        return result;
-    }
-
-    private List<Position> getValidTeleportDestinations(Hero hero, Hero target, Position targetPos) {
-        List<Position> dests = new ArrayList<>();
-
-        for (Position neighbor : targetPos.getCardinalNeighbors()) {
-            if (world.canTeleport(hero, target, neighbor)) {
-                dests.add(neighbor);
-            }
-        }
-
-        return dests;
-    }
-
-    private int getLane(int col) {
-        if (col == 0 || col == 1) return 0;
-        if (col == 3 || col == 4) return 1;
-        if (col == 6 || col == 7) return 2;
         return -1;
     }
 
-    private String getDirection(Position from, Position to) {
-        if (to.getRow() < from.getRow()) return "North";
-        if (to.getRow() > from.getRow()) return "South";
-        if (to.getCol() < from.getCol()) return "West";
-        if (to.getCol() > from.getCol()) return "East";
-        return "Same";
+    private void setupHeroCommands() {
+        heroCommands = new CommandRegistry<>();
+        heroCommands.register("W", "Move Up", hero -> MoveHandler.handleMove('W', createValorMoveAdapter(hero)));
+        heroCommands.register("A", "Move Left", hero -> MoveHandler.handleMove('A', createValorMoveAdapter(hero)));
+        heroCommands.register("S", "Move Down", hero -> MoveHandler.handleMove('S', createValorMoveAdapter(hero)));
+        heroCommands.register("D", "Move Right", hero -> MoveHandler.handleMove('D', createValorMoveAdapter(hero)));
+        heroCommands.register("Q", "Attack", hero -> {
+            ValorAction action = chooseAttackAction(hero);
+            return action != null && executeHeroAction(hero, action);
+        });
+        heroCommands.register("E", "Cast Spell", hero -> {
+            ValorAction action = chooseSpellAction(hero);
+            return action != null && executeHeroAction(hero, action);
+        });
+        heroCommands.register("P", "Use Potion", hero -> {
+            ValorAction action = choosePotionAction(hero);
+            return action != null && executeHeroAction(hero, action);
+        });
+        heroCommands.register("K", "Equip", this::handleEquipCommand);
+        heroCommands.register("M", "Market", hero -> {
+            marketMenu.open(hero);
+            needsRender = true;
+            return false;
+        });
+        heroCommands.register("T", "Teleport", hero -> {
+            ValorAction action = chooseTeleportAction(hero);
+            return action != null && executeHeroAction(hero, action);
+        });
+        heroCommands.register("R", "Recall", hero -> executeHeroAction(hero, ValorAction.recall()));
+        heroCommands.register("O", "Remove Obstacle", this::handleRemoveObstacle);
+        heroCommands.register("I", "Info", hero -> {
+            infoMenu.open(hero);
+            return false;
+        });
+        heroCommands.register("Z", "Quit", hero -> quitGame());
     }
 
-    // ========================================================================
-    // RECALL HANDLER (YOUR IMPLEMENTATION)
-    // ========================================================================
+    private MoveAdapter createValorMoveAdapter(final Hero hero) {
+        return new MoveAdapter() {
+            private Position lastDestination;
+
+            @Override
+            public String actorName() {
+                return hero != null ? hero.getName() : "Hero";
+            }
+
+            @Override
+            public boolean move(char wasd) {
+                Position current = board.getPosition(hero);
+                Position moveTo = targetFromDirection(current, wasd);
+                if (moveTo == null) {
+                    System.out.println("Cannot move out of bounds.");
+                    return false;
+                }
+                lastDestination = moveTo;
+                boolean moved = board.moveHero(hero, moveTo);
+                if (!moved) {
+                    System.out.println("Move not allowed.");
+                    return false;
+                }
+                needsRender = true;
+                return true;
+            }
+
+            @Override
+            public void afterSuccessfulMove() {
+                handleHeroReachingMonsterNexus(lastDestination);
+            }
+        };
+    }
+
+    private boolean executeHeroAction(Hero hero, ValorAction action) {
+        ActionType type = action.getType();
+        switch (type) {
+            case MOVE:
+                return handleMove(hero, action.getDestination());
+            case ATTACK:
+                return logResult(combatResolver.attack(hero, action.getMonsterTarget()));
+            case CAST_SPELL:
+                return logResult(combatResolver.castSpell(hero, action.getSpell(), action.getMonsterTarget()));
+            case USE_POTION:
+                return logResult(combatResolver.usePotion(hero, action.getIndex()));
+            case EQUIP:
+                return logResult(combatResolver.equip(hero, action.getItem()));
+            case TELEPORT:
+                return handleTeleport(hero, action.getHeroTarget(), action.getDestination());
+            case RECALL:
+                return handleRecall(hero);
+            case REMOVE_OBSTACLE:
+                return handleRemoveObstacle(hero, action.getDestination());
+            case QUIT:
+                return quitGame();
+            default:
+                return false;
+        }
+    }
+
+    private boolean handleMove(Hero hero, Position target) {
+        boolean moved = board.moveHero(hero, target);
+        if (moved) {
+            handleHeroReachingMonsterNexus(target);
+            needsRender = true;
+            return true;
+        }
+        System.out.println("Move not allowed.");
+        return false;
+    }
+
+    private boolean handleTeleport(Hero hero, Hero targetHero, Position destination) {
+        if (targetHero == null || destination == null) {
+            System.out.println("Invalid teleport target.");
+            return false;
+        }
+        if (board.teleport(hero, targetHero, destination)) {
+            handleHeroReachingMonsterNexus(destination);
+            needsRender = true;
+            return true;
+        }
+        System.out.println("Teleport failed.");
+        return false;
+    }
 
     private boolean handleRecall(Hero hero) {
-        Position nexus = world.recallDestination(hero);
+        if (board.recall(hero)) {
+            needsRender = true;
+            return true;
+        }
+        System.out.println("Recall failed.");
+        return false;
+    }
 
-        if (nexus == null) {
-            System.out.println("❌ Cannot recall (no spawn point found).");
+    private ValorAction chooseAttackAction(Hero hero) {
+        List<Monster> inRange = combatResolver.attackableMonsters(hero, monsters);
+        if (inRange.isEmpty()) {
+            System.out.println("No monsters in range to attack.");
+            return null;
+        }
+        battleUI.printTargetsWithHp(inRange, board);
+        int choice = promptInt("Attack target: ", 1, inRange.size());
+        return ValorAction.attack(inRange.get(choice - 1));
+    }
+
+    private ValorAction chooseSpellAction(Hero hero) {
+        List<Spell> spells = new ArrayList<>(hero.getSpells());
+        if (spells.isEmpty()) {
+            System.out.println("No spells available.");
+            return null;
+        }
+        for (int i = 0; i < spells.size(); i++) {
+            Spell sp = spells.get(i);
+            System.out.printf("%d) %s DMG %.0f Mana %.0f%n", i + 1, sp.getName(), sp.getBaseDamage(), sp.getManaCost());
+        }
+        int spellChoice = promptInt("Cast which spell: ", 1, spells.size());
+        Spell spell = spells.get(spellChoice - 1);
+        List<Monster> targets = combatResolver.attackableMonsters(hero, monsters);
+        if (targets.isEmpty()) {
+            System.out.println("No monsters in range to target.");
+            return null;
+        }
+        battleUI.printTargetsWithHp(targets, board);
+        int targetChoice = promptInt("Target: ", 1, targets.size());
+        return ValorAction.castSpell(spell, targets.get(targetChoice - 1));
+    }
+
+    private ValorAction choosePotionAction(Hero hero) {
+        List<Potion> potions = hero.getInventory().getPotions();
+        if (potions.isEmpty()) {
+            System.out.println("No potions in inventory.");
+            return null;
+        }
+        for (int i = 0; i < potions.size(); i++) {
+            System.out.printf("%d) %s%n", i + 1, potions.get(i).getDescription());
+        }
+        int choice = promptInt("Use which potion: ", 1, potions.size());
+        return ValorAction.usePotion(choice - 1);
+    }
+
+
+    private ValorAction chooseTeleportAction(Hero hero) {
+        List<Hero> candidates = heroesInOtherLanes(hero);
+        if (candidates.isEmpty()) {
+            System.out.println("No heroes in other lanes to teleport near.");
+            return null;
+        }
+        for (int i = 0; i < candidates.size(); i++) {
+            Position pos = board.getPosition(candidates.get(i));
+            System.out.printf("%d) %s at (%d,%d)%n", i + 1, candidates.get(i).getName(), pos.getRow(), pos.getCol());
+        }
+        int choice = promptInt("Teleport near which hero: ", 1, candidates.size());
+        Hero target = candidates.get(choice - 1);
+        Position targetPos = board.getPosition(target);
+        List<Position> validDestinations = board.validTeleportDestinations(hero, target);
+        if (validDestinations.isEmpty()) {
+            System.out.println("No valid teleport cells near that hero.");
+            return null;
+        }
+        System.out.println("Choose direction:");
+        List<Direction> options = new ArrayList<>();
+        for (Direction dir : Direction.values()) {
+            Position dest = dir.apply(targetPos);
+            if (dest != null && validDestinations.contains(dest)) {
+                options.add(dir);
+            }
+        }
+        for (int i = 0; i < options.size(); i++) {
+            System.out.printf("%d) %s%n", i + 1, options.get(i).getLabel());
+        }
+        int destChoice = promptInt("Destination: ", 1, options.size());
+        Direction chosen = options.get(destChoice - 1);
+        Position destination = chosen.apply(targetPos);
+        if (destination == null) {
+            System.out.println("Teleport failed.");
+            return null;
+        }
+        System.out.printf("Teleported to the %s of %s at (%d,%d).%n",
+                chosen.getLabel(), target.getName(), destination.getRow(), destination.getCol());
+        return ValorAction.teleport(target, destination);
+    }
+
+    private boolean handleRemoveObstacle(Hero hero) {
+        Position heroPos = board.getPosition(hero);
+        List<Position> options = heroPos.getCardinalNeighbors();
+        List<Position> obstacles = new ArrayList<>();
+        for (Position pos : options) {
+            if (board.isObstacle(pos)) {
+                obstacles.add(pos);
+            }
+        }
+        if (obstacles.isEmpty()) {
+            System.out.println("No adjacent obstacles to remove.");
             return false;
         }
-
-        if (world.relocateHero(hero, nexus)) {
-            System.out.println("✅ " + hero.getName() + " recalled to Nexus at (" +
-                    nexus.getRow() + ", " + nexus.getCol() + ")!");
-            return true;
-        } else {
-            System.out.println("❌ Recall failed.");
+        for (int i = 0; i < obstacles.size(); i++) {
+            Position pos = obstacles.get(i);
+            System.out.printf("%d) Obstacle at (%d,%d)%n", i + 1, pos.getRow(), pos.getCol());
+        }
+        int choice = promptInt("Remove which obstacle (0 to cancel): ", 0, obstacles.size());
+        if (choice == 0) {
             return false;
+        }
+        Position target = obstacles.get(choice - 1);
+        needsRender = true;
+        return handleRemoveObstacle(hero, target);
+    }
+
+    private boolean handleRemoveObstacle(Hero hero, Position target) {
+        if (target == null) {
+            System.out.println("Invalid target.");
+            return false;
+        }
+        boolean removed = board.removeObstacle(hero, target);
+        if (removed) {
+            System.out.printf("Removed obstacle at (%d,%d).%n", target.getRow(), target.getCol());
+            needsRender = true;
+            return true;
+        }
+        System.out.println("Cannot remove obstacle there (must be adjacent obstacle).");
+        return false;
+    }
+
+    private boolean handleEquipCommand(Hero hero) {
+        Item item = equipMenu.chooseItemToEquip(hero);
+        if (item == null) {
+            return false;
+        }
+        ActionResult result = combatResolver.equip(hero, item);
+        if (result != null && result.getMessage() != null) {
+            System.out.println(result.getMessage());
+        }
+        needsRender = true;
+        return result != null && result.isSuccess();
+    }
+
+    private List<Hero> heroesInOtherLanes(Hero hero) {
+        Position heroPos = board.getPosition(hero);
+        int lane = board.laneId(heroPos);
+        List<Hero> others = new ArrayList<>();
+        for (Hero h : heroes) {
+            if (h == hero || h.isFainted()) continue;
+            Position pos = board.getPosition(h);
+            if (pos != null && board.laneId(pos) != lane) {
+                others.add(h);
+            }
+        }
+        return others;
+    }
+
+    private void monstersTurn() {
+        List<Monster> order = new ArrayList<>(monsters);
+        for (Monster monster : order) {
+            if (monster.isFainted()) {
+                continue;
+            }
+            ActionResult result = monsterController.takeTurn(monster, heroes);
+            if (result != null) {
+                battleUI.printMonsterTurnStatus(monster, heroes, board, result.getMessage());
+            }
+            Position pos = board.getPosition(monster);
+            if (pos != null && board.isHeroNexus(pos)) {
+                endGame(GameEndReason.MONSTER_WIN_NEXUS);
+                return;
+            }
+        }
+        needsRender = true;
+    }
+
+    private void reviveFaintedHeroes() {
+        for (Hero hero : heroes) {
+            if (!hero.isFainted()) {
+                continue;
+            }
+            Position spawn = board.recallDestination(hero);
+            hero.reviveHalf();
+            if (spawn != null) {
+                board.placeHero(hero, spawn);
+            }
         }
     }
 
-    // ========================================================================
-    // HELPER METHODS
-    // ========================================================================
+    private void regenerateHeroes() {
+        for (Hero hero : heroes) {
+            if (hero.isFainted()) {
+                continue;
+            }
+            hero.heal(hero.getMaxHp() * 0.1);
+            hero.restoreMana(hero.getMaxMana() * 0.1);
+        }
+    }
+
+    private void spawnIfNeeded() {
+        if (roundNumber % spawnInterval != 0) {
+            return;
+        }
+        List<Monster> spawned = spawnManager.spawnWave(heroes);
+        monsters.addAll(spawned);
+        if (!spawned.isEmpty()) {
+            System.out.println("New monsters have spawned.");
+            needsRender = true;
+        }
+    }
 
     private void selectHeroes() {
-        System.out.println("\n📋 Select 3 heroes:");
-
+        System.out.println("Select " + LANE_COUNT + " heroes (one per lane).");
         List<Hero> available = new ArrayList<>();
         available.addAll(gameData.getWarriors());
         available.addAll(gameData.getSorcerers());
         available.addAll(gameData.getPaladins());
-
-        for (int i = 0; i < 3; i++) {
-            System.out.println("\n🦸 Hero " + (i + 1) + " for Lane " + (i + 1) + ":");
+        for (int i = 0; i < LANE_COUNT; i++) {
             for (int j = 0; j < available.size(); j++) {
                 Hero h = available.get(j);
-                System.out.printf("  %d) %s - %s\n", j + 1, h.getName(), h.fullInfo());
+                System.out.printf("%d) %s Level %d HP %.0f MP %.0f%n", j + 1, h.getName(), h.getLevel(), h.getMaxHp(), h.getMaxMana());
             }
-
-            int choice = promptInt("Select hero: ", 1, available.size());
-            Hero chosen = available.remove(choice - 1);
-            heroes.add(chosen);
-            System.out.println("✅ " + chosen.getName() + " selected!");
+            int choice = promptInt("Hero for lane " + (i + 1) + ": ", 1, available.size());
+            heroes.add(available.remove(choice - 1));
         }
     }
 
     private void placeHeroesInLanes() {
-        int[] laneCols = {0, 3, 6}; // Left side of each lane
-        int spawnRow = 7; // Bottom Nexus row
-
+        int[] laneCols = {0, 3, 6};
+        int spawnRow = 7;
         for (int i = 0; i < heroes.size(); i++) {
             Position spawnPos = new Position(spawnRow, laneCols[i]);
-            world.placeHero(heroes.get(i), spawnPos);
-            System.out.println("  " + heroes.get(i).getName() + " spawned in Lane " + (i + 1));
-        }
-    }
-
-    private void spawnMonsters() {
-        int highestLevel = heroes.stream()
-                .mapToInt(Hero::getLevel)
-                .max()
-                .orElse(1);
-
-        int[] laneCols = {1, 4, 7}; // Right side of each lane
-        int spawnRow = 0; // Top Nexus row
-
-        List<Monster> pool = new ArrayList<>();
-        pool.addAll(gameData.getDragons());
-        pool.addAll(gameData.getExoskeletons());
-        pool.addAll(gameData.getSpirits());
-
-        for (int i = 0; i < laneCols.length; i++) {
-            Monster template = pool.get(random.nextInt(pool.size()));
-            Monster scaled = template.scaledCopyForLevel(highestLevel);
-
-            Position spawnPos = new Position(spawnRow, laneCols[i]);
-            if (world.placeMonster(scaled, spawnPos)) {
-                monsters.add(scaled);
-                System.out.println("  👾 " + scaled.getName() + " spawned in Lane " + (i + 1));
-            }
+            board.placeHero(heroes.get(i), spawnPos);
         }
     }
 
     private int selectDifficulty() {
-        System.out.println("\n⚙️  Select difficulty:");
-        System.out.println("  1) Easy (spawn every 8 rounds)");
-        System.out.println("  2) Medium (spawn every 6 rounds)");
-        System.out.println("  3) Hard (spawn every 4 rounds)");
-
+        System.out.println("1) Easy (spawn every 8 rounds)");
+        System.out.println("2) Medium (spawn every 6 rounds)");
+        System.out.println("3) Hard (spawn every 4 rounds)");
         int choice = promptInt("Choice: ", 1, 3);
-
         switch (choice) {
             case 1: return 8;
             case 2: return 6;
@@ -449,78 +620,188 @@ public class LegendsOfValorGame extends RPGGame {
         }
     }
 
+    private Position targetFromDirection(Position current, char dir) {
+        int r = current.getRow();
+        int c = current.getCol();
+        switch (dir) {
+            case 'W': r -= 1; break;
+            case 'S': r += 1; break;
+            case 'A': c -= 1; break;
+            case 'D': c += 1; break;
+            default: return null;
+        }
+        try {
+            return new Position(r, c);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     private int promptInt(String prompt, int min, int max) {
-        while (true) {
-            try {
-                System.out.print(prompt);
-                int val = Integer.parseInt(scanner.nextLine().trim());
-                if (val >= min && val <= max) return val;
-                System.out.println("Please enter a number between " + min + " and " + max);
-            } catch (NumberFormatException e) {
-                System.out.println("Invalid input.");
-            }
+        return InputUtil.promptInt(in, prompt, min, max, () -> {
+            System.out.println("Input closed. Exiting game.");
+            quitGame();
+        });
+    }
+
+    private boolean quitGame() {
+        endGame(GameEndReason.PLAYER_QUIT);
+        return true;
+    }
+
+    private boolean logResult(ActionResult result) {
+        if (result == null) {
+            return false;
+        }
+        System.out.println(result.getMessage());
+        needsRender = true;
+        return result.isSuccess();
+    }
+
+    private void endGame(GameEndReason reason) {
+        endReason = reason;
+        gameOver = true;
+    }
+
+    private void handleHeroReachingMonsterNexus(Position destination) {
+        if (destination != null && board.isMonsterNexus(destination)) {
+            endGame(GameEndReason.HERO_WIN_NEXUS);
         }
     }
 
-    private void showInfo() {
-        System.out.println("\n" + "=".repeat(50));
-        System.out.println("GAME INFO");
-        System.out.println("=".repeat(50));
-
-        System.out.println("\n🦸 Heroes:");
-        for (Hero h : heroes) {
-            Position pos = world.getPosition(h);
-            System.out.printf("  %s at (%d,%d) - HP: %.0f/%.0f, MP: %.0f/%.0f\n",
-                    h.getName(), pos.getRow(), pos.getCol(),
-                    h.getHp(), h.getMaxHp(), h.getMana(), h.getMaxMana());
+    private void renderGameView(boolean includeRoundHeader, Hero currentHero) {
+        if (includeRoundHeader) {
+            System.out.println("===== ROUND " + roundNumber + " =====");
         }
-
-        System.out.println("\n👾 Monsters:");
-        for (Monster m : monsters) {
-            if (!m.isFainted()) {
-                Position pos = world.getPosition(m);
-                System.out.printf("  %s at (%d,%d) - HP: %.0f/%.0f\n",
-                        m.getName(), pos.getRow(), pos.getCol(),
-                        m.getHp(), m.getMaxHp());
-            }
-        }
+        world.printMap();
+        battleUI.printMonsterSummary(monsters, board);
+        battleUI.printHeroesOnBoard(heroes, currentHero, board);
     }
 
-    private boolean checkHeroesWin() {
+    private Hero nextAliveHero(int startIdx) {
+        for (int i = startIdx; i < heroes.size(); i++) {
+            Hero h = heroes.get(i);
+            if (!h.isFainted()) {
+                return h;
+            }
+        }
+        return null;
+    }
+
+    private void printGameOverSummary() {
+        if (endReason == null) {
+            return;
+        }
+        System.out.println(ColorUtil.BOLD + ColorUtil.BRIGHT_WHITE + "======================" + ColorUtil.RESET);
+        System.out.println(ColorUtil.BOLD + ColorUtil.BRIGHT_WHITE + "GAME OVER" + ColorUtil.RESET);
+        String resultLine;
+        switch (endReason) {
+            case HERO_WIN_NEXUS:
+                resultLine = "Result: VICTORY (Heroes reached the Monster Nexus)";
+                break;
+            case MONSTER_WIN_NEXUS:
+                resultLine = "Result: DEFEAT (A monster reached the Hero Nexus)";
+                break;
+            case PLAYER_QUIT:
+            default:
+                resultLine = "Result: QUIT (Player chose to quit)";
+                break;
+        }
+        System.out.println(resultLine);
+        System.out.println("Rounds played: " + roundNumber);
+        System.out.println("Final Heroes:");
         for (Hero hero : heroes) {
-            Position pos = world.getPosition(hero);
-            if (pos != null && pos.getRow() == 0) {
-                return true;
-            }
+            Position pos = board.getPosition(hero);
+            int lane = pos != null ? board.laneId(pos) + 1 : -1;
+            System.out.printf("  H: %s Lane %d at (%d,%d)%n", hero.shortStatus(), lane,
+                    pos != null ? pos.getRow() : -1, pos != null ? pos.getCol() : -1);
         }
-        return false;
+        System.out.println("Final Monsters on board:");
+        for (Monster monster : monsters) {
+            if (monster.isFainted()) continue;
+            Position pos = board.getPosition(monster);
+            int lane = pos != null ? board.laneId(pos) + 1 : -1;
+            System.out.printf("  M: %s Lane %d at (%d,%d)%n", monster.shortStatus(), lane,
+                    pos != null ? pos.getRow() : -1, pos != null ? pos.getCol() : -1);
+        }
+        System.out.println(ColorUtil.BOLD + ColorUtil.BRIGHT_WHITE + "======================" + ColorUtil.RESET);
     }
 
-    private boolean checkMonstersWin() {
-        for (Monster monster : monsters) {
-            if (!monster.isFainted()) {
-                Position pos = world.getPosition(monster);
-                if (pos != null && pos.getRow() == 7) {
-                    return true;
+    private MarketAccessPolicy createValorMarketPolicy() {
+        return new MarketAccessPolicy() {
+            @Override
+            public boolean canAccessMarket(Hero hero) {
+                return board.isHeroNexus(board.getPosition(hero));
+            }
+
+            @Override
+            public String denyMessage() {
+                return "You must be on your Nexus to access the market.";
+            }
+        };
+    }
+
+    private MarketCallbacks createValorMarketCallbacks() {
+        return new MarketCallbacks() {
+            @Override
+            public void onClose(Hero hero) {
+                needsRender = true;
+            }
+
+            @Override
+            public void onInputClosed(Hero hero) {
+                System.out.println("Input closed. Exiting game.");
+                quitGame();
+            }
+        };
+    }
+
+    private InfoProvider createInfoProvider() {
+        return new InfoProvider() {
+            @Override
+            public void printHeroDetails(Hero hero) {
+                battleUI.printHeroInfo(hero, board);
+            }
+
+            @Override
+            public void printInventory(Hero hero) {
+                battleUI.printHeroInventory(hero);
+            }
+
+            @Override
+            public void printSpells(Hero hero) {
+                battleUI.printHeroSpells(hero);
+            }
+
+            @Override
+            public void printTeamSummary() {
+                System.out.println("--- Team Summary ---");
+                for (Hero h : heroes) {
+                    Position pos = board.getPosition(h);
+                    int lane = pos != null ? board.laneId(pos) + 1 : -1;
+                    System.out.printf("H: %s Lane %d at (%d,%d) %s%n", h.shortStatus(), lane,
+                            pos != null ? pos.getRow() : -1, pos != null ? pos.getCol() : -1,
+                            h.isFainted() ? "[Fainted]" : "");
                 }
             }
-        }
-        return false;
-    }
 
-    private void monstersTurn() {
-        // Teammate will implement monster AI
-        System.out.println("\n👾 Monsters' turn (not yet implemented)...");
-    }
-
-    private void endOfRoundRegeneration() {
-        for (Hero hero : heroes) {
-            if (!hero.isFainted()) {
-                double hpRegen = hero.getMaxHp() * 0.1;
-                double mpRegen = hero.getMaxMana() * 0.1;
-                hero.heal(hpRegen);
-                hero.restoreMana(mpRegen);
+            @Override
+            public void printMonstersSummary() {
+                System.out.println("--- Monsters Summary ---");
+                boolean any = false;
+                for (Monster m : monsters) {
+                    if (m.isFainted()) continue;
+                    Position pos = board.getPosition(m);
+                    if (pos == null) continue;
+                    any = true;
+                    int lane = board.laneId(pos) + 1;
+                    System.out.printf("M: %s Lane %d at (%d,%d)%n", m.shortStatus(), lane, pos.getRow(), pos.getCol());
+                }
+                if (!any) {
+                    System.out.println("No active monsters.");
+                }
             }
-        }
+        };
     }
+
 }
